@@ -1,15 +1,11 @@
-FROM debian:buster-slim AS build
+FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.24.3-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
 
-WORKDIR /tmp
-ARG GCSPROXY_VERSION=0.4.2
+WORKDIR /build
+ADD go.mod go.sum *.go ./
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM64="v9.0" go build -ldflags '-extldflags "-static"' -o gcsproxy *.go
 
-RUN apt-get update \
-    && apt-get install --no-install-suggests --no-install-recommends --yes ca-certificates wget \
-    && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
-    && tar zxf gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
-    && cp ./gcsproxy-${GCSPROXY_VERSION}-linux-amd64/gcsproxy .
-
-FROM gcr.io/distroless/base
-COPY --from=build /tmp/gcsproxy /gcsproxy
-ENTRYPOINT ["/gcsproxy"]
-CMD [ "-b", "0.0.0.0:80" ]
+FROM scratch
+COPY --from=builder /etc/ssl /etc/ssl
+COPY --from=builder /build/gcsproxy /gcsproxy
