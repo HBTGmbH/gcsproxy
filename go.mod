@@ -2,6 +2,8 @@ module github.com/daichirata/gcsproxy
 
 go 1.24.0
 
+toolchain go1.25.4
+
 require (
 	cloud.google.com/go/storage v1.56.0
 	github.com/gorilla/mux v1.8.1
