@@ -211,24 +211,47 @@ func getOrHead(w http.ResponseWriter, r *http.Request) {
 		handleError(w, bucket, object, err)
 		return
 	}
+	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
 	if lastStrs, ok := r.Header["If-None-Match"]; ok && len(lastStrs) > 0 {
 		// The value of the ETag HTTP Header is always quoted, whereas
 		// the attribute returned by the GCS API is not. We need to add
 		// quotes to the ETag value to compare them.
 		if attrs.Etag != "" && (lastStrs[0] == "\""+attrs.Etag+"\"" || lastStrs[0] == "W/\""+attrs.Etag+"\"") {
+			// send ETag if present
+			if attrs.Etag != "" {
+				if gzipAcceptable && attrs.ContentEncoding != "gzip" && isExtensionGzippable(filepath.Ext(object)) {
+					setStrHeader(w, "ETag", "W/\""+attrs.Etag+"\"")
+				} else {
+					setStrHeader(w, "ETag", "\""+attrs.Etag+"\"")
+				}
+			}
+			// send Cache-Control if present
+			setStrHeader(w, "Cache-Control", attrs.CacheControl)
+			// send Last-Modified if present
+			setTimeHeader(w, "Last-Modified", attrs.Updated)
 			w.WriteHeader(304)
 			return
 		}
-	}
-	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
+	} else if lastStrs, ok = r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
 		last, err := http.ParseTime(lastStrs[0])
 		if err == nil && !attrs.Updated.Truncate(time.Second).After(last) {
+			// send ETag if present
+			if attrs.Etag != "" {
+				if gzipAcceptable && attrs.ContentEncoding != "gzip" && isExtensionGzippable(filepath.Ext(object)) {
+					setStrHeader(w, "ETag", "W/\""+attrs.Etag+"\"")
+				} else {
+					setStrHeader(w, "ETag", "\""+attrs.Etag+"\"")
+				}
+			}
+			// send Cache-Control if present
+			setStrHeader(w, "Cache-Control", attrs.CacheControl)
+			// send Last-Modified if present
+			setTimeHeader(w, "Last-Modified", attrs.Updated)
 			w.WriteHeader(304)
 			return
 		}
 	}
 
-	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
 	objr, err := client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
 	if err != nil {
 		handleError(w, bucket, object, err)
