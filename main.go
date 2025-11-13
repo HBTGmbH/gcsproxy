@@ -6,9 +6,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,19 +17,39 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
 	"cloud.google.com/go/storage"
 	"github.com/gorilla/mux"
 	"google.golang.org/api/option"
 )
 
 var (
-	bind                  = flag.String("b", "0.0.0.0:8080", "Bind address")
-	metricsBind           = flag.String("m", "0.0.0.0:9090", "Bind address for Prometheus /metrics endpoint")
-	gcsApiEndpoint        = flag.String("e", "https://storage.googleapis.com/storage/v1/", "GCS API endpoint")
-	preStopSleep          = flag.Duration("s", 10*time.Second, "Sleep duration before stopping the container after receiving SIGTERM/SIGINT")
-	serverShutdownTimeout = flag.Duration("t", 5*time.Second, "Timeout for gracefully shutting down the net/http server")
-	gzippedResources      = flag.String("g", ".js,.json,.css,.svg,.xml", "Comma-separated list of file extensions (including the dot) that should be served gzipped")
-	keepAliveTimeout      = flag.Duration("k", 20*time.Minute, "The maximum amount of time to wait for the next request before closing the socket")
+	bind                        = flag.String("b", "0.0.0.0:8080", "Bind address")
+	metricsBind                 = flag.String("m", "0.0.0.0:9090", "Bind address for Prometheus /metrics endpoint")
+	gcsApiEndpoint              = flag.String("e", "https://storage.googleapis.com/storage/v1/", "GCS API endpoint")
+	preStopSleep                = flag.Duration("s", 10*time.Second, "Sleep duration before stopping the container after receiving SIGTERM/SIGINT")
+	serverShutdownTimeout       = flag.Duration("t", 5*time.Second, "Timeout for gracefully shutting down the net/http server")
+	gzippedResources            = flag.String("g", ".js,.json,.css,.svg,.xml", "Comma-separated list of file extensions (including the dot) that should be served gzipped")
+	keepAliveTimeout            = flag.Duration("k", 20*time.Minute, "The maximum amount of time to wait for the next request before closing the socket")
+	h2MaxConcurrentStreams      = flag.Uint("h2-max-concurrent-streams", 0, "The maximum number of concurrent streams for HTTP/2 connections (default: 0, HTTP runtime chooses a default of at least 100)")
+	h2MaxDecoderHeaderTableSize = flag.Uint("h2-max-decoder-header-table-size", 4096, "The maximum size of the decoder header table for HTTP/2 connections (default: 4096 bytes)")
+	h2MaxEncoderHeaderTableSize = flag.Uint("h2-max-encoder-header-table-size", 4096, "The maximum size of the encoder header table for HTTP/2 connections (default: 4096 bytes)")
+	h2MaxReadFrameSize          = flag.Uint("h2-max-read-frame-size", 0, "The maximum size of a read frame for HTTP/2 connections (default: 0 bytes, HTTP runtime chooses a default)")
+	h2PingTimeout               = flag.Duration("h2-ping-timeout", 15*time.Second, "The maximum time to wait for a ping response in HTTP/2 connections (default: 15 seconds)")
+	h2ReadIdleTimeout           = flag.Duration("h2-read-idle-timeout", 0, "The timeout after which a health check using a ping frame will be carried out if no frame is received on the connection (default: 0, no timeout)")
+	h2WriteByteTimeout          = flag.Duration("h2-write-byte-timeout", 0, "The timeout after which a connection will be closed if no data can be written to it (default: 0, no timeout)")
+)
+
+var (
+	http2ErrorsMetric = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "go_http2_errors",
+		Help: "The total number of HTTP/2 errors",
+	}, []string{"error_type"})
 )
 
 var client *storage.Client
@@ -344,7 +361,18 @@ func main() {
 	rMetrics.Handle("/metrics", promhttp.Handler()).Methods(http.MethodGet, http.MethodHead)
 
 	h2s := &http2.Server{
-		IdleTimeout: *keepAliveTimeout,
+		IdleTimeout:               *keepAliveTimeout,
+		MaxConcurrentStreams:      uint32(*h2MaxConcurrentStreams),
+		MaxDecoderHeaderTableSize: uint32(*h2MaxDecoderHeaderTableSize),
+		MaxEncoderHeaderTableSize: uint32(*h2MaxEncoderHeaderTableSize),
+		MaxReadFrameSize:          uint32(*h2MaxReadFrameSize),
+		PingTimeout:               *h2PingTimeout,
+		ReadIdleTimeout:           *h2ReadIdleTimeout,
+		WriteByteTimeout:          *h2WriteByteTimeout,
+		CountError: func(errType string) {
+			http2ErrorsMetric.WithLabelValues(errType).Inc()
+			logger.Error("HTTP/2 error", "error_type", errType)
+		},
 	}
 	server := &http.Server{
 		Addr:        *bind,
