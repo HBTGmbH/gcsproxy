@@ -1,4 +1,7 @@
-.git/
-.idea/
-Dockerfile
-README.md
+# Ignore everything
+*
+
+# Except Go files and ca-certificates.crt
+!**/*.go
+!go.sum
+!go.mod
