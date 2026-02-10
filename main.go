@@ -8,17 +8,17 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -29,27 +29,19 @@ import (
 )
 
 var (
-	bind                        = flag.String("b", "0.0.0.0:8080", "Bind address")
-	metricsBind                 = flag.String("m", "0.0.0.0:9090", "Bind address for Prometheus /metrics endpoint")
-	gcsApiEndpoint              = flag.String("e", "https://storage.googleapis.com/storage/v1/", "GCS API endpoint")
-	preStopSleep                = flag.Duration("s", 10*time.Second, "Sleep duration before stopping the container after receiving SIGTERM/SIGINT")
-	serverShutdownTimeout       = flag.Duration("t", 5*time.Second, "Timeout for gracefully shutting down the net/http server")
-	gzippedResources            = flag.String("g", ".js,.json,.css,.svg,.xml", "Comma-separated list of file extensions (including the dot) that should be served gzipped")
-	keepAliveTimeout            = flag.Duration("k", 20*time.Minute, "The maximum amount of time to wait for the next request before closing the socket")
-	h2MaxConcurrentStreams      = flag.Uint("h2-max-concurrent-streams", 0, "The maximum number of concurrent streams for HTTP/2 connections (default: 0, HTTP runtime chooses a default of at least 100)")
-	h2MaxDecoderHeaderTableSize = flag.Uint("h2-max-decoder-header-table-size", 4096, "The maximum size of the decoder header table for HTTP/2 connections (default: 4096 bytes)")
-	h2MaxEncoderHeaderTableSize = flag.Uint("h2-max-encoder-header-table-size", 4096, "The maximum size of the encoder header table for HTTP/2 connections (default: 4096 bytes)")
-	h2MaxReadFrameSize          = flag.Uint("h2-max-read-frame-size", 0, "The maximum size of a read frame for HTTP/2 connections (default: 0 bytes, HTTP runtime chooses a default)")
-	h2PingTimeout               = flag.Duration("h2-ping-timeout", 15*time.Second, "The maximum time to wait for a ping response in HTTP/2 connections (default: 15 seconds)")
-	h2ReadIdleTimeout           = flag.Duration("h2-read-idle-timeout", 0, "The timeout after which a health check using a ping frame will be carried out if no frame is received on the connection (default: 0, no timeout)")
-	h2WriteByteTimeout          = flag.Duration("h2-write-byte-timeout", 0, "The timeout after which a connection will be closed if no data can be written to it (default: 0, no timeout)")
+	bind                  = flag.String("b", "0.0.0.0:8080", "Bind address")
+	metricsBind           = flag.String("m", "0.0.0.0:9090", "Bind address for Prometheus /metrics endpoint")
+	gcsApiEndpoint        = flag.String("e", "https://storage.googleapis.com/storage/v1/", "GCS API endpoint")
+	preStopSleep          = flag.Duration("s", 0*time.Second, "Sleep duration before stopping the container after receiving SIGTERM/SIGINT")
+	drainTimeout          = flag.Duration("d", 15*time.Second, "Timeout for draining idle connections before shutting down the server")
+	serverShutdownTimeout = flag.Duration("t", 30*time.Second, "Timeout for gracefully shutting down the net/http server")
+	gzippedResources      = flag.String("g", ".js,.json,.css,.svg,.xml", "Comma-separated list of file extensions (including the dot) that should be served gzipped")
+	keepAliveTimeout      = flag.Duration("k", 20*time.Minute, "The maximum amount of time to wait for the next request before closing the socket")
 )
 
 var (
-	http2ErrorsMetric = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "go_http2_errors",
-		Help: "The total number of HTTP/2 errors",
-	}, []string{"error_type"})
+	draining             = atomic.Bool{}
+	openConnectionsCount int64
 )
 
 var client *storage.Client
@@ -331,8 +323,8 @@ func getOrHead(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func validate(handler func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
+func validate(handler func(http.ResponseWriter, *http.Request)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		params := mux.Vars(r)
 		bucket := params["bucket"]
 		if bucket == "" {
@@ -349,7 +341,7 @@ func validate(handler func(w http.ResponseWriter, r *http.Request)) func(w http.
 			return
 		}
 		handler(w, r)
-	}
+	})
 }
 
 func healthCheck(w http.ResponseWriter, _ *http.Request) {
@@ -375,7 +367,13 @@ func main() {
 		w.WriteHeader(http.StatusBadRequest)
 	})
 	r.HandleFunc("/_health", healthCheck).Methods(http.MethodGet, http.MethodHead)
-	r.HandleFunc("/{bucket:[0-9a-zA-Z-_.]+}/{object:.+}", validate(getOrHead)).Methods(http.MethodGet, http.MethodHead)
+	r.Handle("/_sleep", WithConnectionDraining(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}),
+		func() bool { return draining.Load() })).Methods(http.MethodGet)
+	r.Handle("/{bucket:[0-9a-zA-Z-_.]+}/{object:.+}", WithConnectionDraining(validate(getOrHead),
+		func() bool { return draining.Load() })).Methods(http.MethodGet, http.MethodHead)
 
 	rMetrics := mux.NewRouter()
 	rMetrics.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -383,24 +381,20 @@ func main() {
 	})
 	rMetrics.Handle("/metrics", promhttp.Handler()).Methods(http.MethodGet, http.MethodHead)
 
-	h2s := &http2.Server{
-		IdleTimeout:               *keepAliveTimeout,
-		MaxConcurrentStreams:      uint32(*h2MaxConcurrentStreams),
-		MaxDecoderHeaderTableSize: uint32(*h2MaxDecoderHeaderTableSize),
-		MaxEncoderHeaderTableSize: uint32(*h2MaxEncoderHeaderTableSize),
-		MaxReadFrameSize:          uint32(*h2MaxReadFrameSize),
-		PingTimeout:               *h2PingTimeout,
-		ReadIdleTimeout:           *h2ReadIdleTimeout,
-		WriteByteTimeout:          *h2WriteByteTimeout,
-		CountError: func(errType string) {
-			http2ErrorsMetric.WithLabelValues(errType).Inc()
-			logger.Error("HTTP/2 error", "error_type", errType)
-		},
-	}
 	server := &http.Server{
 		Addr:        *bind,
-		Handler:     h2c.NewHandler(r, h2s),
+		Handler:     r,
 		IdleTimeout: *keepAliveTimeout,
+		ConnState: func(conn net.Conn, state http.ConnState) {
+			switch state {
+			case http.StateNew:
+				atomic.AddInt64(&openConnectionsCount, 1)
+			case http.StateClosed, http.StateHijacked:
+				atomic.AddInt64(&openConnectionsCount, -1)
+			default:
+				// no-op
+			}
+		},
 	}
 
 	h2sMetrics := &http2.Server{
@@ -412,8 +406,8 @@ func main() {
 		IdleTimeout: *keepAliveTimeout,
 	}
 
-	logger.Debug("Listening", "address", *bind)
-	logger.Debug("Listening for /metrics", "address", *metricsBind)
+	logger.Info("Listening", "address", *bind)
+	logger.Info("Listening for /metrics", "address", *metricsBind)
 
 	sigs := make(chan os.Signal, 1)
 	done := make(chan bool, 1)
@@ -444,14 +438,27 @@ func main() {
 
 	// wait for signal to shutdown
 	<-done
-
 	logger.Info("Shutting down server now.")
 	ctx := context.Background()
 	if *serverShutdownTimeout > 0 {
+		logger.Info("Waiting until no new connections should come in anymore", "timeout", (*serverShutdownTimeout).String())
 		var cancelFunc context.CancelFunc
 		ctx, cancelFunc = context.WithTimeout(ctx, *serverShutdownTimeout)
 		defer cancelFunc()
 	}
+	if *drainTimeout > 0 {
+		logger.Info("Draining idle connections", "timeout", (*drainTimeout).String())
+		draining.Store(true)
+		drainStart := time.Now()
+		conns := atomic.LoadInt64(&openConnectionsCount)
+		for conns > 0 && time.Since(drainStart) < *drainTimeout {
+			logger.Info("Waiting for connections to drain.", "connections", conns)
+			time.Sleep(1 * time.Second)
+			conns = atomic.LoadInt64(&openConnectionsCount)
+		}
+		logger.Info("Finished draining connections.", "remaining_connections", conns)
+	}
+	logger.Info("Calling server.Shutdown().")
 	err = server.Shutdown(ctx)
 	if err != nil {
 		logger.Error("server.Shutdown returned with an error", "error", err)
